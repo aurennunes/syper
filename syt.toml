@@ -1,0 +1,7 @@
+[project]
+name = "syper"
+version = "0.1.0"
+description = "Micro-framework web estilo Express/Fiber para Syntella, sobre o modulo http da stdlib."
+
+[lib]
+entry = "src/lib.syt"

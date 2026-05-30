@@ -1,0 +1,286 @@
+// syper — um micro-framework web estilo Express/Fiber, escrito puramente em
+// Syntella, em cima do módulo `http` da stdlib.
+//
+// Tudo declarado aqui é exportado como `syper.<symbol>` quando outro projeto
+// faz `use syper`.
+//
+// ---------------------------------------------------------------------------
+// API funcional (e não de métodos) — por quê?
+//
+// No Syntella 0.68.1, blocos `impl ... for` (métodos) só ficam registrados no
+// módulo-raiz que está sendo executado: eles NÃO atravessam a fronteira de um
+// pacote importado. Já funções livres, construtores de tipo, leitura de campo
+// e os métodos da stdlib (writer http, map, array) funcionam de qualquer
+// módulo. Por isso a API do syper é toda baseada em funções livres que
+// recebem o "receptor" como primeiro argumento: `syper.get(app, ...)`,
+// `syper.sendJson(c, ...)`, etc.
+// ---------------------------------------------------------------------------
+//
+// Exemplo de uso (no projeto consumidor):
+//
+//     use syper
+//
+//     func main() {
+//         let app = syper.newApp()
+//
+//         syper.middleware(app, syper.logger())
+//
+//         syper.get(app, "/", func(c) {
+//             syper.send(c, 200, "ola, mundo")
+//         })
+//
+//         syper.get(app, "/users/:id", func(c) {
+//             syper.sendJson(c, 200, {
+//                 "id": syper.param(c, "id"),
+//                 "q": syper.queryParam(c, "q"),
+//             })
+//         })
+//
+//         syper.post(app, "/users", func(c) {
+//             syper.sendJson(c, 201, {"criado": syper.bodyJson(c)})
+//         })
+//
+//         syper.listen(app, ":3000")
+//     }
+//
+// Limitacoes conhecidas (gaps do runtime, nao da linguagem):
+//   - sem acesso a headers da request (só da resposta);
+//   - body é sempre string (sem multipart/upload);
+//   - servidor roda via `syt run` (http.listenAndServe ainda sem backend
+//     compilado);
+//   - query string não é URL-decoded.
+
+use io
+use http
+use json
+
+// ===========================================================================
+// Tipos
+// ===========================================================================
+
+// Contexto de uma requisição, entregue a cada handler e middleware.
+type Ctx {
+    w: any,        // HttpResponseWriter cru da stdlib
+    req: any,      // HttpRequest cru da stdlib
+    params: any,   // Map<string, string> dos parâmetros de rota (ex.: /:id)
+    query: any,    // Map<string, string> da query string (?a=1&b=2)
+}
+
+// Uma rota registrada.
+type Route {
+    method: string,
+    segments: any,  // Array<string>; um segmento ":nome" é um parâmetro
+    handler: any,   // func(Ctx)
+}
+
+// A aplicação: tabela de rotas + pilha de middleware.
+type App {
+    routes: any,  // Array<Route>
+    mws: any,     // Array<func(Ctx, func())>
+}
+
+// ===========================================================================
+// Ctx — helpers (funções livres; recebem o Ctx como 1º argumento)
+// ===========================================================================
+
+func method(c: any): string {
+    return c.req.method
+}
+
+func path(c: any): string {
+    return c.req.path
+}
+
+// Parâmetro de rota; "" se não existir.
+func param(c: any, name: string): string {
+    if c.params.has(name) {
+        return c.params[name]
+    }
+    return ""
+}
+
+// Parâmetro de query string; "" se não existir.
+func queryParam(c: any, name: string): string {
+    if c.query.has(name) {
+        return c.query[name]
+    }
+    return ""
+}
+
+// Corpo cru da requisição.
+func body(c: any): string {
+    return c.req.body
+}
+
+// Corpo decodificado como JSON; {} quando vazio.
+func bodyJson(c: any): any {
+    if c.req.body == "" {
+        return {}
+    }
+    return json.decode(c.req.body)
+}
+
+// Define um header de resposta (deve vir antes de send/sendJson).
+func setHeader(c: any, name: string, value: string) {
+    c.w.setHeader(name, value)
+}
+
+// Resposta de texto puro.
+func send(c: any, code: int, text: string) {
+    c.w.writeHeader(code)
+    c.w.write(text)
+}
+
+// Resposta JSON (faz o encode do valor).
+func sendJson(c: any, code: int, value: any) {
+    c.w.setHeader("Content-Type", "application/json")
+    c.w.writeHeader(code)
+    c.w.write(json.encode(value))
+}
+
+// ===========================================================================
+// Casamento de rota e query
+// ===========================================================================
+
+// Tenta casar a rota com (method, segmentos-do-caminho).
+// Retorna o map de parâmetros se casar, ou `none`.
+func matchRoute(route: any, reqMethod: string, segs: any): any {
+    if route.method != reqMethod {
+        return none
+    }
+    if route.segments.length() != segs.length() {
+        return none
+    }
+    let params = {}
+    let i = 0
+    while i < segs.length() {
+        let rs = route.segments[i]
+        if rs.startsWith(":") {
+            params[rs.split(":")[1]] = segs[i]
+        } else if rs != segs[i] {
+            return none
+        }
+        i = i + 1
+    }
+    return params
+}
+
+// Faz o parse de "a=1&b=2" a partir da url crua (ex.: "/x?a=1&b=2").
+func parseQuery(url: string): any {
+    let q = {}
+    let parts = url.split("?")
+    if parts.length() < 2 {
+        return q
+    }
+    let pairs = parts[1].split("&")
+    for pair in pairs {
+        if pair != "" {
+            let kv = pair.split("=")
+            let val = ""
+            if kv.length() >= 2 {
+                val = kv[1]
+            }
+            q[kv[0]] = val
+        }
+    }
+    return q
+}
+
+// ===========================================================================
+// Cadeia de middleware
+// ===========================================================================
+// Um middleware tem a forma `func(Ctx, func())`: recebe o contexto e um
+// `next` que, quando chamado, continua para o próximo middleware (e, por fim,
+// para o handler da rota). Não chamar `next()` interrompe a cadeia.
+
+func runChain(mws: any, i: int, finalHandler: any, c: any) {
+    if i >= mws.length() {
+        finalHandler(c)
+        return
+    }
+    let mw = mws[i]
+    let next = func() {
+        runChain(mws, i + 1, finalHandler, c)
+    }
+    mw(c, next)
+}
+
+// ===========================================================================
+// App — registro de rotas e servidor (funções livres)
+// ===========================================================================
+
+// Cria uma aplicação nova, sem rotas nem middleware.
+func newApp(): App {
+    return App([], [])
+}
+
+// Registra uma rota para um método HTTP qualquer.
+func handle(app: any, httpMethod: string, pattern: string, h: any) {
+    app.routes.push(Route(httpMethod, pattern.split("/"), h))
+}
+
+func get(app: any, pattern: string, h: any) {
+    handle(app, "GET", pattern, h)
+}
+
+func post(app: any, pattern: string, h: any) {
+    handle(app, "POST", pattern, h)
+}
+
+func put(app: any, pattern: string, h: any) {
+    handle(app, "PUT", pattern, h)
+}
+
+func delete(app: any, pattern: string, h: any) {
+    handle(app, "DELETE", pattern, h)
+}
+
+// Adiciona um middleware global (executado na ordem de registro).
+func middleware(app: any, mw: any) {
+    app.mws.push(mw)
+}
+
+// Recebe a request crua, encontra a rota e roda a cadeia.
+func dispatch(app: any, w: any, req: any) {
+    let segs = req.path.split("/")
+    let matched = none
+    let params = {}
+    for route in app.routes {
+        let p = matchRoute(route, req.method, segs)
+        if !isNone(p) {
+            matched = route
+            params = p
+            break
+        }
+    }
+
+    let c = Ctx(w, req, params, parseQuery(req.url))
+
+    if isNone(matched) {
+        sendJson(c, 404, {"error": "nao encontrado", "path": req.path})
+        return
+    }
+
+    runChain(app.mws, 0, matched.handler, c)
+}
+
+// Sobe o servidor HTTP e bloqueia.
+func listen(app: any, addr: string) {
+    http.handleFunc("/", func(w, req) {
+        dispatch(app, w, req)
+    })
+    io.println("syper ouvindo em http://localhost" + addr)
+    http.listenAndServe(addr)
+}
+
+// ===========================================================================
+// Middleware pronto
+// ===========================================================================
+
+// Loga "metodo caminho" de cada request.
+func logger(): any {
+    return func(c, next) {
+        io.println("[syper] " + method(c) + " " + path(c))
+        next()
+    }
+}

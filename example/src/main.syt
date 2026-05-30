@@ -1,0 +1,69 @@
+// Exemplo: uma pequena API de tarefas construída sobre o framework `syper`.
+//
+//   syt run src/main.syt
+//
+// Rotas:
+//   GET    /            -> mensagem de boas-vindas
+//   GET    /todos       -> lista
+//   POST   /todos       -> cria        body: {"title": "..."}
+//   GET    /todos/:id   -> uma tarefa
+//   DELETE /todos/:id   -> remove
+
+use io
+use os
+use syper
+
+let todos = [{"id": 1, "title": "Conhecer o syper", "done": false}]
+let nextId = 2
+
+func main() {
+    let app = syper.newApp()
+
+    // middleware global: loga toda request
+    syper.middleware(app, syper.logger())
+
+    syper.get(app, "/", func(c) {
+        syper.send(c, 200, "API de tarefas movida a syper")
+    })
+
+    syper.get(app, "/todos", func(c) {
+        syper.sendJson(c, 200, todos)
+    })
+
+    syper.post(app, "/todos", func(c) {
+        let data = syper.bodyJson(c)
+        if !data.has("title") {
+            syper.sendJson(c, 400, {"error": "campo 'title' obrigatorio"})
+            return
+        }
+        let todo = {"id": nextId, "title": data["title"], "done": false}
+        todos.push(todo)
+        nextId = nextId + 1
+        syper.sendJson(c, 201, todo)
+    })
+
+    syper.get(app, "/todos/:id", func(c) {
+        let id = syper.param(c, "id")
+        for t in todos {
+            if toString(t["id"]) == id {
+                syper.sendJson(c, 200, t)
+                return
+            }
+        }
+        syper.sendJson(c, 404, {"error": "tarefa nao encontrada"})
+    })
+
+    syper.delete(app, "/todos/:id", func(c) {
+        let id = syper.param(c, "id")
+        let kept = []
+        for t in todos {
+            if toString(t["id"]) != id {
+                kept.push(t)
+            }
+        }
+        todos = kept
+        syper.sendJson(c, 200, {"deleted": id})
+    })
+
+    syper.listen(app, ":" + os.envOr("PORT", "3000"))
+}
