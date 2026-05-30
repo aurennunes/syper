@@ -8,36 +8,29 @@
 // API funcional (e não de métodos) — por quê?
 //
 // No Syntella 0.68.1, blocos `impl ... for` (métodos) só ficam registrados no
-// módulo-raiz que está sendo executado: eles NÃO atravessam a fronteira de um
-// pacote importado. Já funções livres, construtores de tipo, leitura de campo
-// e os métodos da stdlib (writer http, map, array) funcionam de qualquer
-// módulo. Por isso a API do syper é toda baseada em funções livres que
-// recebem o "receptor" como primeiro argumento: `syper.get(app, ...)`,
-// `syper.sendJson(c, ...)`, etc.
+// módulo-raiz em execução: NÃO atravessam a fronteira de um pacote importado.
+// Já funções livres, construtores de tipo, leitura de campo e os métodos da
+// stdlib (writer http, map, array) funcionam de qualquer módulo. Por isso a
+// API do syper é toda baseada em funções livres que recebem o "receptor" como
+// primeiro argumento: `syper.get(app, ...)`, `syper.sendJson(c, ...)`.
 // ---------------------------------------------------------------------------
 //
-// Exemplo de uso (no projeto consumidor):
+// Exemplo:
 //
 //     use syper
 //
 //     func main() {
 //         let app = syper.newApp()
-//
 //         syper.middleware(app, syper.logger())
 //
 //         syper.get(app, "/", func(c) {
 //             syper.send(c, 200, "ola, mundo")
 //         })
 //
-//         syper.get(app, "/users/:id", func(c) {
-//             syper.sendJson(c, 200, {
-//                 "id": syper.param(c, "id"),
-//                 "q": syper.queryParam(c, "q"),
-//             })
-//         })
-//
-//         syper.post(app, "/users", func(c) {
-//             syper.sendJson(c, 201, {"criado": syper.bodyJson(c)})
+//         let api = syper.group(app, "/api")
+//         syper.middleware(api, meuAuth)
+//         syper.get(api, "/users/:id", func(c) {
+//             syper.replyJson(syper.status(c, 200), {"id": syper.param(c, "id")})
 //         })
 //
 //         syper.listen(app, ":3000")
@@ -46,9 +39,9 @@
 // Limitacoes conhecidas (gaps do runtime, nao da linguagem):
 //   - sem acesso a headers da request (só da resposta);
 //   - body é sempre string (sem multipart/upload);
-//   - servidor roda via `syt run` (http.listenAndServe ainda sem backend
-//     compilado);
-//   - query string não é URL-decoded.
+//   - servidor roda via `syt run` (sem backend compilado p/ listenAndServe);
+//   - URL-decode trata %XX como byte único (ASCII ok; multibyte não é
+//     recombinado em UTF-8).
 
 use io
 use http
@@ -60,23 +53,112 @@ use json
 
 // Contexto de uma requisição, entregue a cada handler e middleware.
 type Ctx {
-    w: any,        // HttpResponseWriter cru da stdlib
-    req: any,      // HttpRequest cru da stdlib
-    params: any,   // Map<string, string> dos parâmetros de rota (ex.: /:id)
-    query: any,    // Map<string, string> da query string (?a=1&b=2)
+    w: any,           // HttpResponseWriter cru da stdlib
+    req: any,         // HttpRequest cru da stdlib
+    params: any,      // Map<string, string> dos parâmetros de rota (/:id)
+    query: any,       // Map<string, string> da query string (?a=1&b=2)
+    statusCode: int,  // status corrente (default 200), setado por status()
 }
 
-// Uma rota registrada.
-type Route {
-    method: string,
-    segments: any,  // Array<string>; um segmento ":nome" é um parâmetro
-    handler: any,   // func(Ctx)
+// Nó do trie de roteamento.
+type Node {
+    children: any,    // Map<string, Node>  — segmentos literais
+    paramChild: any,  // Node | none        — segmento de parâmetro (:nome)
+    paramName: string,
+    handlers: any,    // Map<string, handler>  — método -> handler (já embrulhado)
 }
 
-// A aplicação: tabela de rotas + pilha de middleware.
+// A aplicação: trie de rotas + middleware global.
 type App {
-    routes: any,  // Array<Route>
-    mws: any,     // Array<func(Ctx, func())>
+    kind: string,     // "app"
+    root: any,        // Node
+    mws: any,         // Array<func(Ctx, func())>
+}
+
+// Um grupo de rotas com prefixo e middleware próprios.
+type Group {
+    kind: string,     // "group"
+    app: any,         // App ou Group (permite aninhamento)
+    prefix: string,
+    mws: any,         // Array<func(Ctx, func())>
+}
+
+// ===========================================================================
+// Helpers de string: segmentos de caminho e URL-decode
+// ===========================================================================
+
+// Divide um caminho em segmentos não vazios. "/users/:id" -> ["users", ":id"];
+// "/" -> [].
+func pathSegs(p: string): any {
+    let out = []
+    for s in p.split("/") {
+        if s != "" {
+            out.push(s)
+        }
+    }
+    return out
+}
+
+// Valor de um dígito hexadecimal, ou -1 se inválido.
+func hexDigit(ch: string): int {
+    let o = ord(ch)
+    if o >= 48 && o <= 57 {
+        return o - 48
+    }
+    if o >= 97 && o <= 102 {
+        return o - 87
+    }
+    if o >= 65 && o <= 70 {
+        return o - 55
+    }
+    return -1
+}
+
+// Decodifica %XX (e, se `plus`, '+' -> espaço). Trata cada %XX como byte único.
+func urlDecode(s: string, plus: bool): string {
+    let out = ""
+    let i = 0
+    while i < s.length() {
+        let ch = s[i]
+        if ch == "%" && i + 2 < s.length() {
+            let hi = hexDigit(s[i + 1])
+            let lo = hexDigit(s[i + 2])
+            if hi >= 0 && lo >= 0 {
+                out = out + chr(hi * 16 + lo)
+                i = i + 3
+            } else {
+                out = out + ch
+                i = i + 1
+            }
+        } else if plus && ch == "+" {
+            out = out + " "
+            i = i + 1
+        } else {
+            out = out + ch
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// Faz o parse de "a=1&b=2" a partir da url crua (ex.: "/x?a=1&b=2").
+func parseQuery(url: string): any {
+    let q = {}
+    let parts = url.split("?")
+    if parts.length() < 2 {
+        return q
+    }
+    for pair in parts[1].split("&") {
+        if pair != "" {
+            let kv = pair.split("=")
+            let val = ""
+            if kv.length() >= 2 {
+                val = kv[1]
+            }
+            q[urlDecode(kv[0], true)] = urlDecode(val, true)
+        }
+    }
+    return q
 }
 
 // ===========================================================================
@@ -120,78 +202,97 @@ func bodyJson(c: any): any {
     return json.decode(c.req.body)
 }
 
-// Define um header de resposta (deve vir antes de send/sendJson).
+// Define um header de resposta (deve vir antes de qualquer write).
 func setHeader(c: any, name: string, value: string) {
     c.w.setHeader(name, value)
 }
 
-// Resposta de texto puro.
+// Define o status corrente e retorna o próprio ctx (encadeável):
+//   syper.replyJson(syper.status(c, 201), valor)
+func status(c: any, code: int): any {
+    c.statusCode = code
+    return c
+}
+
+// --- respostas com código explícito ---
+
 func send(c: any, code: int, text: string) {
     c.w.writeHeader(code)
     c.w.write(text)
 }
 
-// Resposta JSON (faz o encode do valor).
 func sendJson(c: any, code: int, value: any) {
     c.w.setHeader("Content-Type", "application/json")
     c.w.writeHeader(code)
     c.w.write(json.encode(value))
 }
 
-// ===========================================================================
-// Casamento de rota e query
-// ===========================================================================
+// --- respostas que usam o status corrente (combinam com status()) ---
 
-// Tenta casar a rota com (method, segmentos-do-caminho).
-// Retorna o map de parâmetros se casar, ou `none`.
-func matchRoute(route: any, reqMethod: string, segs: any): any {
-    if route.method != reqMethod {
-        return none
-    }
-    if route.segments.length() != segs.length() {
-        return none
-    }
-    let params = {}
-    let i = 0
-    while i < segs.length() {
-        let rs = route.segments[i]
-        if rs.startsWith(":") {
-            params[rs.split(":")[1]] = segs[i]
-        } else if rs != segs[i] {
-            return none
-        }
-        i = i + 1
-    }
-    return params
+func reply(c: any, text: string) {
+    c.w.writeHeader(c.statusCode)
+    c.w.write(text)
 }
 
-// Faz o parse de "a=1&b=2" a partir da url crua (ex.: "/x?a=1&b=2").
-func parseQuery(url: string): any {
-    let q = {}
-    let parts = url.split("?")
-    if parts.length() < 2 {
-        return q
-    }
-    let pairs = parts[1].split("&")
-    for pair in pairs {
-        if pair != "" {
-            let kv = pair.split("=")
-            let val = ""
-            if kv.length() >= 2 {
-                val = kv[1]
+func replyJson(c: any, value: any) {
+    c.w.setHeader("Content-Type", "application/json")
+    c.w.writeHeader(c.statusCode)
+    c.w.write(json.encode(value))
+}
+
+// --- helpers extras ---
+
+func html(c: any, code: int, markup: string) {
+    c.w.setHeader("Content-Type", "text/html; charset=utf-8")
+    c.w.writeHeader(code)
+    c.w.write(markup)
+}
+
+func redirect(c: any, code: int, location: string) {
+    c.w.setHeader("Location", location)
+    c.w.writeHeader(code)
+    c.w.write("")
+}
+
+func noContent(c: any) {
+    c.w.writeHeader(204)
+    c.w.write("")
+}
+
+// ===========================================================================
+// Trie de roteamento
+// ===========================================================================
+
+func newNode(): Node {
+    return Node({}, none, "", {})
+}
+
+// Insere uma rota (segmentos já limpos) no trie, sob `method`.
+func trieInsert(root: any, segs: any, httpMethod: string, h: any) {
+    let cur = root
+    for seg in segs {
+        if seg.startsWith(":") {
+            if isNone(cur.paramChild) {
+                cur.paramChild = newNode()
+                cur.paramChild.paramName = seg.split(":")[1]
             }
-            q[kv[0]] = val
+            cur = cur.paramChild
+        } else {
+            if !cur.children.has(seg) {
+                cur.children[seg] = newNode()
+            }
+            cur = cur.children[seg]
         }
     }
-    return q
+    cur.handlers[httpMethod] = h
 }
 
 // ===========================================================================
 // Cadeia de middleware
 // ===========================================================================
 // Um middleware tem a forma `func(Ctx, func())`: recebe o contexto e um
-// `next` que, quando chamado, continua para o próximo middleware (e, por fim,
-// para o handler da rota). Não chamar `next()` interrompe a cadeia.
+// `next` que continua para o próximo middleware (e, por fim, para o handler).
+// Não chamar `next()` interrompe a cadeia (útil para auth, etc.).
 
 func runChain(mws: any, i: int, finalHandler: any, c: any) {
     if i >= mws.length() {
@@ -205,63 +306,117 @@ func runChain(mws: any, i: int, finalHandler: any, c: any) {
     mw(c, next)
 }
 
+// Embrulha um handler para que `mws` rodem antes dele. Captura `mws` por
+// referência, então middleware adicionado depois ao mesmo array também vale.
+func wrapHandler(mws: any, h: any): any {
+    return func(c) {
+        runChain(mws, 0, h, c)
+    }
+}
+
 // ===========================================================================
-// App — registro de rotas e servidor (funções livres)
+// App / Group — registro de rotas (funções livres)
 // ===========================================================================
 
-// Cria uma aplicação nova, sem rotas nem middleware.
+// Cria uma aplicação nova.
 func newApp(): App {
-    return App([], [])
+    return App("app", newNode(), [])
 }
 
-// Registra uma rota para um método HTTP qualquer.
-func handle(app: any, httpMethod: string, pattern: string, h: any) {
-    app.routes.push(Route(httpMethod, pattern.split("/"), h))
+// Cria um grupo com prefixo sobre um app (ou outro grupo).
+func group(target: any, prefix: string): Group {
+    return Group("group", target, prefix, [])
 }
 
-func get(app: any, pattern: string, h: any) {
-    handle(app, "GET", pattern, h)
+// Adiciona middleware — funciona tanto em App quanto em Group.
+func middleware(target: any, mw: any) {
+    target.mws.push(mw)
 }
 
-func post(app: any, pattern: string, h: any) {
-    handle(app, "POST", pattern, h)
+// Núcleo do registro. `routeMws` é o middleware específico desta rota.
+func register(target: any, httpMethod: string, pattern: string, routeMws: any, h: any) {
+    let handler = h
+    if routeMws.length() > 0 {
+        handler = wrapHandler(routeMws, handler)
+    }
+    if target.kind == "group" {
+        // embrulha com o middleware (vivo) do grupo e sobe um nível,
+        // prefixando o caminho. Aninhamento resolve por recursão.
+        let wrapped = wrapHandler(target.mws, handler)
+        register(target.app, httpMethod, target.prefix + pattern, [], wrapped)
+    } else {
+        trieInsert(target.root, pathSegs(pattern), httpMethod, handler)
+    }
 }
 
-func put(app: any, pattern: string, h: any) {
-    handle(app, "PUT", pattern, h)
+// Verbos sem middleware específico.
+func get(target: any, pattern: string, h: any) {
+    register(target, "GET", pattern, [], h)
 }
 
-func delete(app: any, pattern: string, h: any) {
-    handle(app, "DELETE", pattern, h)
+func post(target: any, pattern: string, h: any) {
+    register(target, "POST", pattern, [], h)
 }
 
-// Adiciona um middleware global (executado na ordem de registro).
-func middleware(app: any, mw: any) {
-    app.mws.push(mw)
+func put(target: any, pattern: string, h: any) {
+    register(target, "PUT", pattern, [], h)
 }
 
-// Recebe a request crua, encontra a rota e roda a cadeia.
+func delete(target: any, pattern: string, h: any) {
+    register(target, "DELETE", pattern, [], h)
+}
+
+// Registro genérico com método explícito (sem middleware por rota).
+func handle(target: any, httpMethod: string, pattern: string, h: any) {
+    register(target, httpMethod, pattern, [], h)
+}
+
+// Registro genérico com método explícito e middleware por rota.
+//   syper.routeWith(app, "GET", "/admin", [auth], handler)
+func routeWith(target: any, httpMethod: string, pattern: string, routeMws: any, h: any) {
+    register(target, httpMethod, pattern, routeMws, h)
+}
+
+// ===========================================================================
+// Dispatch e servidor
+// ===========================================================================
+
+// Recebe a request crua, percorre o trie e roda a cadeia.
 func dispatch(app: any, w: any, req: any) {
-    let segs = req.path.split("/")
-    let matched = none
+    let segs = pathSegs(req.path)
+    let cur = app.root
     let params = {}
-    for route in app.routes {
-        let p = matchRoute(route, req.method, segs)
-        if !isNone(p) {
-            matched = route
-            params = p
+    let matched = true
+    for seg in segs {
+        if cur.children.has(seg) {
+            cur = cur.children[seg]
+        } else if !isNone(cur.paramChild) {
+            params[cur.paramChild.paramName] = urlDecode(seg, false)
+            cur = cur.paramChild
+        } else {
+            matched = false
             break
         }
     }
 
-    let c = Ctx(w, req, params, parseQuery(req.url))
+    let c = Ctx(w, req, params, parseQuery(req.url), 200)
 
-    if isNone(matched) {
+    if !matched {
         sendJson(c, 404, {"error": "nao encontrado", "path": req.path})
         return
     }
+    if !cur.handlers.has(req.method) {
+        // caminho existe, mas o método não: 405 se há outros métodos, senão 404
+        if cur.handlers.keys().length() > 0 {
+            sendJson(c, 405, {"error": "metodo nao permitido", "method": req.method})
+        } else {
+            sendJson(c, 404, {"error": "nao encontrado", "path": req.path})
+        }
+        return
+    }
 
-    runChain(app.mws, 0, matched.handler, c)
+    let handler = cur.handlers[req.method]
+    runChain(app.mws, 0, handler, c)
 }
 
 // Sobe o servidor HTTP e bloqueia.

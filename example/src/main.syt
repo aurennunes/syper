@@ -1,13 +1,15 @@
-// Exemplo: uma pequena API de tarefas construída sobre o framework `syper`.
+// Exemplo: uma pequena API de tarefas construída sobre o framework `syper`,
+// mostrando grupos de rota, middleware de grupo e de rota, e os helpers de
+// resposta.
 //
-//   syt run src/main.syt
+//   syt run src/main.syt            # sobe em :3000
+//   PORT=8080 syt run src/main.syt  # outra porta
 //
-// Rotas:
-//   GET    /            -> mensagem de boas-vindas
-//   GET    /todos       -> lista
-//   POST   /todos       -> cria        body: {"title": "..."}
-//   GET    /todos/:id   -> uma tarefa
-//   DELETE /todos/:id   -> remove
+// Rotas (todas sob o grupo /api):
+//   GET    /api/todos       -> lista
+//   POST   /api/todos       -> cria          body: {"title": "..."}
+//   GET    /api/todos/:id   -> uma tarefa
+//   DELETE /api/todos/:id   -> remove         (exige ?confirm=yes)
 
 use io
 use os
@@ -23,26 +25,33 @@ func main() {
     syper.middleware(app, syper.logger())
 
     syper.get(app, "/", func(c) {
-        syper.send(c, 200, "API de tarefas movida a syper")
+        syper.send(c, 200, "API de tarefas movida a syper — veja /api/todos")
     })
 
-    syper.get(app, "/todos", func(c) {
-        syper.sendJson(c, 200, todos)
+    // grupo /api com um middleware próprio (header em toda resposta do grupo)
+    let api = syper.group(app, "/api")
+    syper.middleware(api, func(c, next) {
+        syper.setHeader(c, "X-Powered-By", "syper")
+        next()
     })
 
-    syper.post(app, "/todos", func(c) {
+    syper.get(api, "/todos", func(c) {
+        syper.replyJson(syper.status(c, 200), todos)
+    })
+
+    syper.post(api, "/todos", func(c) {
         let data = syper.bodyJson(c)
         if !data.has("title") {
-            syper.sendJson(c, 400, {"error": "campo 'title' obrigatorio"})
+            syper.replyJson(syper.status(c, 400), {"error": "campo 'title' obrigatorio"})
             return
         }
         let todo = {"id": nextId, "title": data["title"], "done": false}
         todos.push(todo)
         nextId = nextId + 1
-        syper.sendJson(c, 201, todo)
+        syper.replyJson(syper.status(c, 201), todo)
     })
 
-    syper.get(app, "/todos/:id", func(c) {
+    syper.get(api, "/todos/:id", func(c) {
         let id = syper.param(c, "id")
         for t in todos {
             if toString(t["id"]) == id {
@@ -53,7 +62,8 @@ func main() {
         syper.sendJson(c, 404, {"error": "tarefa nao encontrada"})
     })
 
-    syper.delete(app, "/todos/:id", func(c) {
+    // DELETE com middleware por rota: exige ?confirm=yes
+    syper.routeWith(api, "DELETE", "/todos/:id", [exigirConfirmacao], func(c) {
         let id = syper.param(c, "id")
         let kept = []
         for t in todos {
@@ -66,4 +76,13 @@ func main() {
     })
 
     syper.listen(app, ":" + os.envOr("PORT", "3000"))
+}
+
+// Middleware: só deixa passar se vier ?confirm=yes.
+func exigirConfirmacao(c, next) {
+    if syper.queryParam(c, "confirm") == "yes" {
+        next()
+    } else {
+        syper.sendJson(c, 400, {"error": "use ?confirm=yes para deletar"})
+    }
 }
